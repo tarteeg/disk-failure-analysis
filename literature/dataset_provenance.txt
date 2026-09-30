@@ -1,0 +1,2 @@
+- Github: section 4 - "Disk Failure Data": https://github.com/mooselab/DevOpsDataCollection/blob/main/README.md
+- BackBlaze website -"Hard Drive Reliability Test Data": https://www.backblaze.com/cloud-storage/resources/hard-drive-test-data
