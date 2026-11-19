@@ -1,3 +1,4 @@
 .venv
 data/
 notebooks/cache/
+__pycache__/
