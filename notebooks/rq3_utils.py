@@ -504,6 +504,63 @@ def group_disk_costs(
 
 
 # ==========================================================================
+# Leave-one-model-out: ranking quality at a fixed false alarm rate
+# ==========================================================================
+def recall_at_false_alarm_rate(table: pd.DataFrame, rates, counts=None) -> dict:
+    """Planned recall when a given share of the healthy disks is alerted, from a `disk_table`.
+
+    Threshold free, so it compares two scorers without calibration. For each rate, the
+    threshold is the lowest disk score whose weighted share of healthy disks at or above it
+    stays within `rate`; ties are kept together. Failed disks that cannot be alerted L days
+    ahead (`plannable` False) count as missed. `counts` multiplies the weights (bootstrap).
+    """
+    w = table["weight"].to_numpy(dtype=float)
+    if counts is not None:
+        w = w * np.asarray(counts, dtype=float)
+    failed = table["failed"].to_numpy(dtype=bool)
+    score = table["score"].to_numpy(dtype=float)
+    h_score, h_w = score[~failed], w[~failed]
+    order = np.argsort(-h_score, kind="stable")
+    h_score, h_w = h_score[order], h_w[order]
+    total_h, total_f = h_w.sum(), w[failed].sum()
+    # share of healthy disks alerted at each distinct score value (ties together)
+    last_of_tie = np.r_[h_score[1:] != h_score[:-1], True]
+    share = np.cumsum(h_w)[last_of_tie] / total_h
+    values = h_score[last_of_tie]
+    f_score = score[failed]
+    f_ok = np.isfinite(f_score)
+    out = {}
+    for rate in rates:
+        ok = values[share <= rate]
+        if len(ok) == 0 or total_f == 0:
+            out[rate] = 0.0
+            continue
+        t = ok.min()
+        out[rate] = float(w[failed][f_ok & (np.where(f_ok, f_score, -np.inf) >= t)].sum() / total_f)
+    return out
+
+
+def bootstrap_recall_gap(table_ref: pd.DataFrame, table_alt: pd.DataFrame, rates, n_boot: int = 200, seed: int = 42) -> pd.DataFrame:
+    """Disk bootstrap of recall at fixed false alarm rate for two scorers on the same disks.
+
+    Both tables must cover the same disks. The same resample is applied to both, so the gap
+    `alt - ref` is paired. One row per (resample, rate): ref, alt, gap.
+    """
+    alt = table_alt.reindex(table_ref.index)
+    if alt["failed"].isna().any():
+        raise ValueError("the two tables must cover the same disks")
+    rng = np.random.default_rng(seed)
+    n = len(table_ref)
+    rows = []
+    for _ in range(n_boot):
+        k = rng.multinomial(n, np.full(n, 1.0 / n))
+        a = recall_at_false_alarm_rate(table_ref, rates, counts=k)
+        b = recall_at_false_alarm_rate(alt, rates, counts=k)
+        rows.extend({"rate": r, "ref": a[r], "alt": b[r], "gap": b[r] - a[r]} for r in rates)
+    return pd.DataFrame(rows)
+
+
+# ==========================================================================
 # Plots
 # ==========================================================================
 def plot_reliability(curves: dict, ax=None):
