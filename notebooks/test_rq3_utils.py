@@ -12,6 +12,7 @@ from rq3_utils import (
     IsotonicCalibrator,
     bootstrap_calibration,
     bootstrap_disk_cost,
+    bootstrap_recall_gap,
     brier_score,
     cost_at_threshold,
     disk_outcome_frame,
@@ -24,6 +25,7 @@ from rq3_utils import (
     group_disk_costs,
     healthy_weight_factor,
     load_panel,
+    recall_at_false_alarm_rate,
     reliability_curve,
     rescale_healthy_weights,
     threshold_table,
@@ -265,6 +267,40 @@ def test_group_disk_costs_splits_the_fleet():
     assert np.isclose(sub["false_alarms"].sum(), whole.loc[whole["category"] == "fp", "weight"].sum())
     assert (sub["relative_cost_ci_low"] <= sub["relative_cost_ci_high"]).all()
     assert group_disk_costs(df, "group", [5], "2025-11-30", min_failed=10**6).empty
+
+
+def _score_table():
+    healthy = pd.DataFrame({"failed": False, "weight": 1.0, "score": np.arange(1, 11) / 10, "plannable": True},
+                           index=[f"h{i}" for i in range(10)])
+    failed = pd.DataFrame({"failed": True, "weight": 1.0, "score": [0.95, 0.55, np.nan, 0.05],
+                           "plannable": [True, True, False, True]}, index=list("abcd"))
+    return pd.concat([healthy, failed])
+
+
+def test_recall_at_false_alarm_rate_hand_checked():
+    got = recall_at_false_alarm_rate(_score_table(), [0.05, 0.2, 0.5, 0.6, 1.0])
+    # 10 healthy disks (scores 0.1..1.0), 4 failed (0.95, 0.55, unplannable, 0.05)
+    assert got == {0.05: 0.0, 0.2: 0.25, 0.5: 0.25, 0.6: 0.5, 1.0: 0.5}
+
+
+def test_recall_at_false_alarm_rate_keeps_ties_together_and_weights():
+    t = _score_table()
+    t.loc[[f"h{i}" for i in range(10)], "score"] = 0.5  # every healthy disk tied: no rate below 1 is reachable
+    assert recall_at_false_alarm_rate(t, [0.5])[0.5] == 0.0
+    # doubling the weight of the failed disk caught at rate 0.2 moves the recall from 1/4 to 2/5
+    t = _score_table()
+    t.loc["a", "weight"] = 2.0
+    assert np.isclose(recall_at_false_alarm_rate(t, [0.2])[0.2], 2 / 5)
+
+
+def test_bootstrap_recall_gap_is_zero_for_identical_scorers_and_paired():
+    t = _score_table()
+    out = bootstrap_recall_gap(t, t, [0.2, 0.6], n_boot=30, seed=0)
+    assert len(out) == 60 and (out["gap"] == 0).all()
+    worse = t.copy()
+    worse.loc[worse["failed"], "score"] = 0.0
+    gap = bootstrap_recall_gap(t, worse, [0.6], n_boot=50, seed=0)["gap"]
+    assert (gap <= 0).all() and gap.mean() < 0
 
 
 if __name__ == "__main__":
