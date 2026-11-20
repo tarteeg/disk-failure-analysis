@@ -464,6 +464,45 @@ def bootstrap_calibration(
     return pd.DataFrame(rows)
 
 
+def group_disk_costs(
+    df, group_col: str, ratios, window_end, L: int = 7, min_failed: int = 30, n_boot: int = 200, seed: int = 42,
+    p_col: str = "p", weight_col: str = "pop_weight",
+) -> pd.DataFrame:
+    """Disk-level cost at the Elkan threshold of each cost ratio, split by a disk attribute.
+
+    No refit: the thresholds are those of the whole fleet (1 / (1 + ratio)) and the scores are
+    already calibrated, so a difference between groups is a difference of transfer, not of tuning.
+    One row per (group, ratio): failed disks, planned recall, false alarms, unplanned failures,
+    `relative_cost` = cost / cost of never alerting (below 1 means alerting pays) with a disk
+    bootstrap interval. Groups with fewer than `min_failed` failed disks are left out.
+    """
+    rows = []
+    for name, g in df.groupby(group_col):
+        for r in ratios:
+            frame = disk_outcome_frame(g, elkan_threshold(1.0, float(r)), window_end, L, p_col, weight_col)
+            n_failed = float(frame.loc[frame["failed"], "weight"].sum())
+            if len(frame[frame["failed"]]) < min_failed:
+                break
+            boot = bootstrap_disk_cost(frame, 1.0, float(r), n_boot=n_boot, seed=seed)
+            fp = float(frame.loc[frame["category"] == "fp", "weight"].sum())
+            unplanned = float(frame.loc[frame["category"].isin(["late", "missed"]), "weight"].sum())
+            never = r * n_failed
+            rows.append(
+                {
+                    group_col: name,
+                    "ratio_fn_over_fp": r,
+                    "n_failed": int(len(frame[frame["failed"]])),
+                    "planned_recall": float(frame.loc[frame["category"] == "planned", "weight"].sum() / n_failed),
+                    "false_alarms": fp,
+                    "unplanned": unplanned,
+                    "relative_cost": (fp + r * unplanned) / never,
+                    "relative_cost_ci_low": float(boot["cost"].quantile(0.025) / never),
+                    "relative_cost_ci_high": float(boot["cost"].quantile(0.975) / never),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 # ==========================================================================
 # Plots
 # ==========================================================================

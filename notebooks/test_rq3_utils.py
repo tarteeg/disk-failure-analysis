@@ -21,6 +21,7 @@ from rq3_utils import (
     elkan_threshold,
     empirical_optimal_threshold,
     expected_calibration_error,
+    group_disk_costs,
     healthy_weight_factor,
     load_panel,
     reliability_curve,
@@ -252,6 +253,18 @@ def test_bootstrap_calibration_shape():
     out = bootstrap_calibration(panel, {"raw": s, "same": s}, n_boot=5, seed=0)
     assert len(out) == 10 and set(out["name"]) == {"raw", "same"}
     assert (out["brier"] > 0).all()
+
+
+def test_group_disk_costs_splits_the_fleet():
+    df = make_panel()
+    df["group"] = np.where(df["serial_number"].isin(["A", "C", "E"]), "x", "y")
+    out = group_disk_costs(df, "group", [5, 20], "2025-11-30", min_failed=1, n_boot=20, seed=0)
+    whole = disk_outcome_frame(df, elkan_threshold(1.0, 5.0), "2025-11-30")
+    sub = out[out["ratio_fn_over_fp"] == 5]
+    assert sub["n_failed"].sum() == int(whole["failed"].sum())  # the groups partition the failed disks
+    assert np.isclose(sub["false_alarms"].sum(), whole.loc[whole["category"] == "fp", "weight"].sum())
+    assert (sub["relative_cost_ci_low"] <= sub["relative_cost_ci_high"]).all()
+    assert group_disk_costs(df, "group", [5], "2025-11-30", min_failed=10**6).empty
 
 
 if __name__ == "__main__":
