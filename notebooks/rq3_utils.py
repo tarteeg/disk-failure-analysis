@@ -464,6 +464,102 @@ def bootstrap_calibration(
     return pd.DataFrame(rows)
 
 
+def group_disk_costs(
+    df, group_col: str, ratios, window_end, L: int = 7, min_failed: int = 30, n_boot: int = 200, seed: int = 42,
+    p_col: str = "p", weight_col: str = "pop_weight",
+) -> pd.DataFrame:
+    """Disk-level cost at the Elkan threshold of each cost ratio, split by a disk attribute.
+
+    No refit: the thresholds are those of the whole fleet (1 / (1 + ratio)) and the scores are
+    already calibrated, so a difference between groups is a difference of transfer, not of tuning.
+    One row per (group, ratio): failed disks, planned recall, false alarms, unplanned failures,
+    `relative_cost` = cost / cost of never alerting (below 1 means alerting pays) with a disk
+    bootstrap interval. Groups with fewer than `min_failed` failed disks are left out.
+    """
+    rows = []
+    for name, g in df.groupby(group_col):
+        for r in ratios:
+            frame = disk_outcome_frame(g, elkan_threshold(1.0, float(r)), window_end, L, p_col, weight_col)
+            n_failed = float(frame.loc[frame["failed"], "weight"].sum())
+            if len(frame[frame["failed"]]) < min_failed:
+                break
+            boot = bootstrap_disk_cost(frame, 1.0, float(r), n_boot=n_boot, seed=seed)
+            fp = float(frame.loc[frame["category"] == "fp", "weight"].sum())
+            unplanned = float(frame.loc[frame["category"].isin(["late", "missed"]), "weight"].sum())
+            never = r * n_failed
+            rows.append(
+                {
+                    group_col: name,
+                    "ratio_fn_over_fp": r,
+                    "n_failed": int(len(frame[frame["failed"]])),
+                    "planned_recall": float(frame.loc[frame["category"] == "planned", "weight"].sum() / n_failed),
+                    "false_alarms": fp,
+                    "unplanned": unplanned,
+                    "relative_cost": (fp + r * unplanned) / never,
+                    "relative_cost_ci_low": float(boot["cost"].quantile(0.025) / never),
+                    "relative_cost_ci_high": float(boot["cost"].quantile(0.975) / never),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+# ==========================================================================
+# Leave-one-model-out: ranking quality at a fixed false alarm rate
+# ==========================================================================
+def recall_at_false_alarm_rate(table: pd.DataFrame, rates, counts=None) -> dict:
+    """Planned recall when a given share of the healthy disks is alerted, from a `disk_table`.
+
+    Threshold free, so it compares two scorers without calibration. For each rate, the
+    threshold is the lowest disk score whose weighted share of healthy disks at or above it
+    stays within `rate`; ties are kept together. Failed disks that cannot be alerted L days
+    ahead (`plannable` False) count as missed. `counts` multiplies the weights (bootstrap).
+    """
+    w = table["weight"].to_numpy(dtype=float)
+    if counts is not None:
+        w = w * np.asarray(counts, dtype=float)
+    failed = table["failed"].to_numpy(dtype=bool)
+    score = table["score"].to_numpy(dtype=float)
+    h_score, h_w = score[~failed], w[~failed]
+    order = np.argsort(-h_score, kind="stable")
+    h_score, h_w = h_score[order], h_w[order]
+    total_h, total_f = h_w.sum(), w[failed].sum()
+    # share of healthy disks alerted at each distinct score value (ties together)
+    last_of_tie = np.r_[h_score[1:] != h_score[:-1], True]
+    share = np.cumsum(h_w)[last_of_tie] / total_h
+    values = h_score[last_of_tie]
+    f_score = score[failed]
+    f_ok = np.isfinite(f_score)
+    out = {}
+    for rate in rates:
+        ok = values[share <= rate]
+        if len(ok) == 0 or total_f == 0:
+            out[rate] = 0.0
+            continue
+        t = ok.min()
+        out[rate] = float(w[failed][f_ok & (np.where(f_ok, f_score, -np.inf) >= t)].sum() / total_f)
+    return out
+
+
+def bootstrap_recall_gap(table_ref: pd.DataFrame, table_alt: pd.DataFrame, rates, n_boot: int = 200, seed: int = 42) -> pd.DataFrame:
+    """Disk bootstrap of recall at fixed false alarm rate for two scorers on the same disks.
+
+    Both tables must cover the same disks. The same resample is applied to both, so the gap
+    `alt - ref` is paired. One row per (resample, rate): ref, alt, gap.
+    """
+    alt = table_alt.reindex(table_ref.index)
+    if alt["failed"].isna().any():
+        raise ValueError("the two tables must cover the same disks")
+    rng = np.random.default_rng(seed)
+    n = len(table_ref)
+    rows = []
+    for _ in range(n_boot):
+        k = rng.multinomial(n, np.full(n, 1.0 / n))
+        a = recall_at_false_alarm_rate(table_ref, rates, counts=k)
+        b = recall_at_false_alarm_rate(alt, rates, counts=k)
+        rows.extend({"rate": r, "ref": a[r], "alt": b[r], "gap": b[r] - a[r]} for r in rates)
+    return pd.DataFrame(rows)
+
+
 # ==========================================================================
 # Plots
 # ==========================================================================
